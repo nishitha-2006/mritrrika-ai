@@ -51,38 +51,51 @@ services:
     restart: unless-stopped
 
   minio:
-    image: minio/minio:latest
+    image: cgr.dev/chainguard/minio:latest
     container_name: mrittika-minio
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-change_me_locally}
     ports:
-      - "9000:9000"   # S3 API
+      - "${MINIO_HOST_PORT:-9000}:9000"   # S3 API; change host port if 9000 is occupied
       - "9001:9001"   # web console
     volumes:
       - miniodata:/data
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
     restart: unless-stopped
 
   # Creates the buckets the API expects, then exits. Not a long-running service.
   minio-init:
-    image: minio/mc:latest
+    image: public.ecr.aws/aws-cli/aws-cli:latest
     container_name: mrittika-minio-init
     depends_on:
       minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY:-minioadmin} ${MINIO_SECRET_KEY:-change_me_locally} &&
-      mc mb --ignore-existing local/${MINIO_BUCKET_DOCUMENTS:-mrittika-documents} &&
-      mc mb --ignore-existing local/${MINIO_BUCKET_DERIVED:-mrittika-derived} &&
-      echo 'Mrittika AI: buckets ready'
-      "
+        condition: service_started
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-change_me_locally}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_ENDPOINT_URL: http://minio:9000
+      MINIO_BUCKET_DOCUMENTS: ${MINIO_BUCKET_DOCUMENTS:-mrittika-documents}
+      MINIO_BUCKET_DERIVED: ${MINIO_BUCKET_DERIVED:-mrittika-derived}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        attempts=0
+        until aws s3api list-buckets --no-cli-pager >/dev/null 2>&1; do
+          attempts=$$((attempts + 1))
+          if [ "$$attempts" -ge 30 ]; then
+            echo "MinIO did not become ready" >&2
+            exit 1
+          fi
+          sleep 2
+        done
+        for bucket in "$$MINIO_BUCKET_DOCUMENTS" "$$MINIO_BUCKET_DERIVED"; do
+          aws s3api head-bucket --bucket "$$bucket" --no-cli-pager >/dev/null 2>&1 ||
+            aws s3api create-bucket --bucket "$$bucket" --no-cli-pager
+        done
+        echo "Mrittika AI: buckets ready"
     restart: "no"
 
   # Vector features for authorised officers, behind the API's JWT check
